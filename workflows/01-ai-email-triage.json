@@ -1,0 +1,169 @@
+{
+  "name": "AI Email Triage & Auto-Draft (Gmail + OpenAI + Slack)",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": { "item": [{ "mode": "everyMinute" }] },
+        "simple": false,
+        "filters": { "labelIds": ["INBOX"], "readStatus": "unread" },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000001",
+      "name": "New Gmail Email",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300],
+      "credentials": { "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Normalise the email and trim the body so we don't send huge threads to the model.\nconst out = [];\nfor (const item of $input.all()) {\n  const e = item.json;\n  const body = (e.text || e.snippet || '').replace(/\\s+/g, ' ').trim().slice(0, 4000);\n  out.push({ json: {\n    messageId: e.id,\n    threadId: e.threadId,\n    from: e.from?.value?.[0]?.address || e.from?.text || '',\n    fromName: e.from?.value?.[0]?.name || '',\n    subject: e.subject || '(no subject)',\n    body,\n  }});\n}\nreturn out;"
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000002",
+      "name": "Clean Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/chat/completions",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({\n  model: 'gpt-4o-mini',\n  temperature: 0,\n  response_format: { type: 'json_object' },\n  messages: [\n    { role: 'system', content: 'You triage business emails. Reply ONLY with JSON: {\"category\": one of [\"sales_lead\",\"support\",\"billing\",\"spam\",\"other\"], \"urgency\": one of [\"high\",\"normal\",\"low\"], \"summary\": one sentence, \"needs_reply\": boolean, \"draft_reply\": a short, polite reply in the same language as the email, or empty string}. Never invent prices, dates or promises.' },\n    { role: 'user', content: 'From: ' + $json.fromName + ' <' + $json.from + '>\\nSubject: ' + $json.subject + '\\n\\n' + $json.body }\n  ]\n}) }}",
+        "options": {
+          "retry": { "maxTries": 3, "waitBetweenTries": 2000 },
+          "timeout": 30000
+        }
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000003",
+      "name": "AI Classify & Draft",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [440, 300],
+      "credentials": { "openAiApi": { "id": "REPLACE_ME", "name": "OpenAI account" } },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse the model's JSON safely and merge it with the original email.\nconst emails = $('Clean Email').all();\nreturn $input.all().map((item, i) => {\n  let ai = {};\n  try { ai = JSON.parse(item.json.choices[0].message.content); } catch (e) { ai = { category: 'other', urgency: 'normal', summary: 'AI parse failed', needs_reply: false, draft_reply: '' }; }\n  const allowed = ['sales_lead','support','billing','spam','other'];\n  if (!allowed.includes(ai.category)) ai.category = 'other';\n  return { json: { ...emails[i].json, ...ai } };\n});"
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000004",
+      "name": "Parse AI Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "or",
+          "conditions": [
+            { "id": "c1", "leftValue": "={{ $json.urgency }}", "rightValue": "high", "operator": { "type": "string", "operation": "equals" } },
+            { "id": "c2", "leftValue": "={{ $json.category }}", "rightValue": "sales_lead", "operator": { "type": "string", "operation": "equals" } }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000005",
+      "name": "Urgent or Lead?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "select": "channel",
+        "channelId": { "__rl": true, "value": "#inbox-alerts", "mode": "name" },
+        "text": "={{ ($json.category === 'sales_lead' ? ':moneybag: *New sales lead*' : ':rotating_light: *Urgent email*') + '\\n*From:* ' + $json.fromName + ' <' + $json.from + '>\\n*Subject:* ' + $json.subject + '\\n*Summary:* ' + $json.summary }}",
+        "otherOptions": {}
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000006",
+      "name": "Alert on Slack",
+      "type": "n8n-nodes-base.slack",
+      "typeVersion": 2.2,
+      "position": [1100, 100],
+      "credentials": { "slackApi": { "id": "REPLACE_ME", "name": "Slack account" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "typeValidation": "loose" },
+          "combinator": "and",
+          "conditions": [
+            { "id": "c3", "leftValue": "={{ $json.needs_reply }}", "rightValue": true, "operator": { "type": "boolean", "operation": "true", "singleValue": true } },
+            { "id": "c4", "leftValue": "={{ $json.category }}", "rightValue": "spam", "operator": { "type": "string", "operation": "notEquals" } }
+          ]
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000007",
+      "name": "Needs Reply?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 420]
+    },
+    {
+      "parameters": {
+        "resource": "draft",
+        "subject": "={{ 'Re: ' + $json.subject }}",
+        "message": "={{ $json.draft_reply }}",
+        "options": { "threadId": "={{ $json.threadId }}", "sendTo": "={{ $json.from }}" }
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000008",
+      "name": "Create Gmail Draft",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1100, 400],
+      "credentials": { "gmailOAuth2": { "id": "REPLACE_ME", "name": "Gmail account" } }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": { "__rl": true, "value": "REPLACE_WITH_SHEET_ID", "mode": "id" },
+        "sheetName": { "__rl": true, "value": "Email Log", "mode": "name" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Date": "={{ $now.toISO() }}",
+            "From": "={{ $json.from }}",
+            "Subject": "={{ $json.subject }}",
+            "Category": "={{ $json.category }}",
+            "Urgency": "={{ $json.urgency }}",
+            "Summary": "={{ $json.summary }}"
+          },
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "a1b2c3d4-0001-4000-8000-000000000009",
+      "name": "Log to Google Sheets",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [880, 620],
+      "credentials": { "googleSheetsOAuth2Api": { "id": "REPLACE_ME", "name": "Google Sheets account" } }
+    }
+  ],
+  "connections": {
+    "New Gmail Email": { "main": [[{ "node": "Clean Email", "type": "main", "index": 0 }]] },
+    "Clean Email": { "main": [[{ "node": "AI Classify & Draft", "type": "main", "index": 0 }]] },
+    "AI Classify & Draft": { "main": [[{ "node": "Parse AI Result", "type": "main", "index": 0 }]] },
+    "Parse AI Result": {
+      "main": [[
+        { "node": "Urgent or Lead?", "type": "main", "index": 0 },
+        { "node": "Needs Reply?", "type": "main", "index": 0 },
+        { "node": "Log to Google Sheets", "type": "main", "index": 0 }
+      ]]
+    },
+    "Urgent or Lead?": { "main": [[{ "node": "Alert on Slack", "type": "main", "index": 0 }], []] },
+    "Needs Reply?": { "main": [[{ "node": "Create Gmail Draft", "type": "main", "index": 0 }], []] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {}
+}
